@@ -64,6 +64,21 @@ th{background:#fafbfe;color:var(--muted);position:sticky;top:0}
 .daily{overflow:auto;margin-top:10px}.daily table{font-size:12px}
 .note{font-size:12px;color:var(--muted);margin-top:8px}
 .empty{padding:40px;text-align:center;color:var(--muted)}
+.category-group-row td{
+  text-align:left !important;
+  font-weight:800;
+  color:#244b86;
+  background:#edf4ff;
+  border-top:2px solid #d6e5ff;
+  border-bottom:1px solid #d6e5ff;
+  padding:10px 12px;
+}
+.category-group-row .group-count{
+  margin-left:8px;
+  color:#6b7f9f;
+  font-weight:600;
+  font-size:12px;
+}
 .source-banner{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:-4px 0 14px;color:#64748b;font-size:12px}
 .source-chip{padding:6px 9px;border-radius:999px;background:#eef2f7}
 @media(max-width:1450px){.kpis{grid-template-columns:repeat(4,1fr)}}
@@ -130,13 +145,13 @@ th{background:#fafbfe;color:var(--muted);position:sticky;top:0}
   <div class="card controls">
     <select id="categorySelect"><option value="全部">全部产品分类</option></select>
     <input id="search" placeholder="搜索款式/名称">
-    <select id="sort">
-      <option value="qty26">按2026同期销量排序</option>
-      <option value="full25">按2025整月销量排序</option>
-      <option value="qty25">按2025同期销量排序</option>
-      <option value="combined">按两年同期合计销量排序</option>
-      <option value="diff">按同期增减件数排序</option>
-      <option value="pct">按同期同比排序</option>
+    <select id="sort" disabled title="当前已固定：分类和款式都按2026同期销量从高到低排序">
+      <option value="qty26">固定：分类/款式按2026同期销量降序</option>
+      <option value="full25">分类内按2025整月销量排序</option>
+      <option value="qty25">分类内按2025同期销量排序</option>
+      <option value="combined">分类内按两年同期合计销量排序</option>
+      <option value="diff">分类内按同期增减件数排序</option>
+      <option value="pct">分类内按同期同比排序</option>
     </select>
     <button class="btn active" data-st="全部">全部状态</button>
     <button class="btn" data-st="共同款">共同款</button>
@@ -187,6 +202,11 @@ async function inflateRaw(bytes){
 }
 async function unzipXlsx(buffer){
   const u8=new Uint8Array(buffer), dv=new DataView(buffer);
+  const readU64=(off)=>{
+    const v=dv.getBigUint64(off,true);
+    if(v>BigInt(Number.MAX_SAFE_INTEGER))throw new Error('Excel文件过大，浏览器无法安全读取。');
+    return Number(v);
+  };
   let eocd=-1;
   for(let i=u8.length-22;i>=Math.max(0,u8.length-65557);i--){
     if(dv.getUint32(i,true)===0x06054b50){eocd=i;break;}
@@ -195,14 +215,43 @@ async function unzipXlsx(buffer){
   const total=dv.getUint16(eocd+10,true), cdOffset=dv.getUint32(eocd+16,true);
   let p=cdOffset; const entries=new Map(), td=new TextDecoder('utf-8');
   for(let i=0;i<total;i++){
-    if(dv.getUint32(p,true)!==0x02014b50)break;
-    const method=dv.getUint16(p+10,true), csize=dv.getUint32(p+20,true);
+    if(dv.getUint32(p,true)!==0x02014b50)throw new Error('Excel压缩目录结构异常。');
+    const method=dv.getUint16(p+10,true);
+    let csize=dv.getUint32(p+20,true);
+    let usize=dv.getUint32(p+24,true);
     const nameLen=dv.getUint16(p+28,true), extraLen=dv.getUint16(p+30,true), commentLen=dv.getUint16(p+32,true);
-    const localOffset=dv.getUint32(p+42,true);
+    const diskStart=dv.getUint16(p+34,true);
+    let localOffset=dv.getUint32(p+42,true);
     const name=td.decode(u8.slice(p+46,p+46+nameLen));
-    if(dv.getUint32(localOffset,true)!==0x04034b50)throw new Error('Excel压缩结构异常。');
+
+    // 支持聚水潭导出文件常见的 ZIP64 格式：
+    // 当32位字段为 0xFFFFFFFF / 0xFFFF 时，真实值保存在 0x0001 扩展字段中。
+    if(usize===0xffffffff || csize===0xffffffff || localOffset===0xffffffff || diskStart===0xffff){
+      const extraStart=p+46+nameLen, extraEnd=extraStart+extraLen;
+      let ep=extraStart, found=false;
+      while(ep+4<=extraEnd){
+        const id=dv.getUint16(ep,true), sz=dv.getUint16(ep+2,true);
+        const dataStart=ep+4, dataEnd=dataStart+sz;
+        if(dataEnd>extraEnd)break;
+        if(id===0x0001){
+          found=true; let q=dataStart;
+          if(usize===0xffffffff){usize=readU64(q);q+=8;}
+          if(csize===0xffffffff){csize=readU64(q);q+=8;}
+          if(localOffset===0xffffffff){localOffset=readU64(q);q+=8;}
+          // diskStart 若为0xffff，ZIP64中后续为4字节；本页面不需要使用。
+          break;
+        }
+        ep=dataEnd;
+      }
+      if(!found)throw new Error('Excel使用ZIP64格式，但未找到必要的ZIP64扩展信息。');
+    }
+
+    if(localOffset<0 || localOffset+30>u8.length || dv.getUint32(localOffset,true)!==0x04034b50)
+      throw new Error('Excel压缩文件定位失败：'+name);
     const ln=dv.getUint16(localOffset+26,true), le=dv.getUint16(localOffset+28,true);
-    const start=localOffset+30+ln+le, comp=u8.slice(start,start+csize);
+    const start=localOffset+30+ln+le, end=start+csize;
+    if(end>u8.length)throw new Error('Excel压缩数据长度异常：'+name);
+    const comp=u8.slice(start,end);
     let raw;
     if(method===0)raw=comp;
     else if(method===8)raw=await inflateRaw(comp);
@@ -375,7 +424,79 @@ function getList(){
   if(state.category!=='全部')L=L.filter(c=>c.category===state.category);
   if(state.kw){const k=state.kw.toLowerCase();L=L.filter(c=>(c.style+c.name).toLowerCase().includes(k));}
   if(state.st!=='全部')L=L.filter(c=>c.status===state.st);
-  L.sort((a,b)=>state.sort==='qty26'?b.qty26-a.qty26:state.sort==='full25'?b.full25-a.full25:state.sort==='qty25'?b.qty25-a.qty25:state.sort==='combined'?b.combined-a.combined:state.sort==='diff'?b.diff-a.diff:((b.pct===null?999999:b.pct)-(a.pct===null?999999:a.pct)));
+
+  const sortWithinCategory=(a,b)=>{
+    let result=0;
+    if(state.sort==='qty26')result=b.qty26-a.qty26;
+    else if(state.sort==='full25')result=b.full25-a.full25;
+    else if(state.sort==='qty25')result=b.qty25-a.qty25;
+    else if(state.sort==='combined')result=b.combined-a.combined;
+    else if(state.sort==='diff')result=b.diff-a.diff;
+    else result=(b.pct===null?999999:b.pct)-(a.pct===null?999999:a.pct);
+    if(result!==0)return result;
+    return String(a.style||'').localeCompare(String(b.style||''),'zh-CN');
+  };
+
+  // “全部产品分类”时：先按分类的2026同期总销量从高到低排，
+  // 再在每个分类内部按当前选择的规则排产品。
+  if(state.category==='全部'){
+    const categoryTotals=L.reduce((m,c)=>{
+      const k=String(c.category||'未分类');
+      if(!m[k])m[k]={qty26:0,qty25:0,full25:0};
+      m[k].qty26+=Number(c.qty26||0);
+      m[k].qty25+=Number(c.qty25||0);
+      m[k].full25+=Number(c.full25||0);
+      return m;
+    },{});
+
+    L.sort((a,b)=>{
+      const ca=String(a.category||'未分类');
+      const cb=String(b.category||'未分类');
+
+      // 第一优先：分类的2026同期总销量
+      const diffCategory=(categoryTotals[cb]?.qty26||0)-(categoryTotals[ca]?.qty26||0);
+      if(diffCategory!==0)return diffCategory;
+
+      // 第二优先：如2026同期相同，再看2025同期
+      const diff25=(categoryTotals[cb]?.qty25||0)-(categoryTotals[ca]?.qty25||0);
+      if(diff25!==0)return diff25;
+
+      // 第三优先：再看2025整月
+      const diffFull=(categoryTotals[cb]?.full25||0)-(categoryTotals[ca]?.full25||0);
+      if(diffFull!==0)return diffFull;
+
+      // 同一分类内部固定按2026同期销量从高到低排
+      if(ca===cb){
+        const diffStyle=(Number(b.qty26||0)-Number(a.qty26||0));
+        if(diffStyle!==0)return diffStyle;
+
+        // 2026同期销量相同时，依次参考2025同期、2025整月
+        const diffStyle25=(Number(b.qty25||0)-Number(a.qty25||0));
+        if(diffStyle25!==0)return diffStyle25;
+
+        const diffStyleFull=(Number(b.full25||0)-Number(a.full25||0));
+        if(diffStyleFull!==0)return diffStyleFull;
+
+        return String(a.style||'').localeCompare(String(b.style||''),'zh-CN');
+      }
+
+      return ca.localeCompare(cb,'zh-CN');
+    });
+  }else{
+    // 选择单一分类时，同样固定按2026同期销量从高到低排
+    L.sort((a,b)=>{
+      const diffStyle=(Number(b.qty26||0)-Number(a.qty26||0));
+      if(diffStyle!==0)return diffStyle;
+
+      const diffStyle25=(Number(b.qty25||0)-Number(a.qty25||0));
+      if(diffStyle25!==0)return diffStyle25;
+
+      const diffStyleFull=(Number(b.full25||0)-Number(a.full25||0));
+      if(diffStyleFull!==0)return diffStyleFull;
+
+      return String(a.style||'').localeCompare(String(b.style||''),'zh-CN');
+    });
+  }
   return L;
 }
 function updateForecast(L){
@@ -409,7 +530,36 @@ function render(){
   document.getElementById('syncInfo').textContent=`同期范围：10月1日-${syncDay}日`;
   document.getElementById('sourceInfo').textContent='数据源：'+(DATA.meta?.source||'当前数据');
 
-  document.getElementById('tb').innerHTML=L.length?L.map(c=>`<tr><td>${c.style}</td><td>${c.category||'—'}</td><td><b class="orange">${fmt(c.full25)}件</b></td><td>${fmt(c.qty25)}件</td><td><b class="blue">${fmt(c.qty26)}件</b></td><td class="${c.diff>=0?'green':'red'}">${c.diff>=0?'+':''}${fmt(c.diff)}件</td><td class="${c.pct===null?'blue':(c.pct>=0?'green':'red')}">${pct(c.pct)}</td><td>${c.status}</td></tr>`).join(''):`<tr><td colspan="8" class="empty">当前筛选条件下没有数据</td></tr>`;
+  if(L.length){
+    let lastCategory=null;
+    const categoryCounts=L.reduce((m,c)=>{
+      const k=c.category||'未分类';
+      m[k]=(m[k]||0)+1;
+      return m;
+    },{});
+    const categoryQty25=L.reduce((m,c)=>{
+      const k=c.category||'未分类';
+      m[k]=(m[k]||0)+Number(c.qty25||0);
+      return m;
+    },{});
+    const categoryQty26=L.reduce((m,c)=>{
+      const k=c.category||'未分类';
+      m[k]=(m[k]||0)+Number(c.qty26||0);
+      return m;
+    },{});
+    const rows=[];
+    L.forEach(c=>{
+      const category=c.category||'未分类';
+      if(state.category==='全部' && category!==lastCategory){
+        rows.push(`<tr class="category-group-row"><td colspan="8">${category}<span class="group-count">${categoryCounts[category]}款｜2025同期 ${fmt(categoryQty25[category]||0)}件｜2026同期 ${fmt(categoryQty26[category]||0)}件</span></td></tr>`);
+        lastCategory=category;
+      }
+      rows.push(`<tr><td>${c.style}</td><td>${c.category||'—'}</td><td><b class="orange">${fmt(c.full25)}件</b></td><td>${fmt(c.qty25)}件</td><td><b class="blue">${fmt(c.qty26)}件</b></td><td class="${c.diff>=0?'green':'red'}">${c.diff>=0?'+':''}${fmt(c.diff)}件</td><td class="${c.pct===null?'blue':(c.pct>=0?'green':'red')}">${pct(c.pct)}</td><td>${c.status}</td></tr>`);
+    });
+    document.getElementById('tb').innerHTML=rows.join('');
+  }else{
+    document.getElementById('tb').innerHTML=`<tr><td colspan="8" class="empty">当前筛选条件下没有数据</td></tr>`;
+  }
 
   const days=Array.from({length:syncDay},(_,i)=>i+1);
   document.getElementById('cards').innerHTML=L.length?L.map(c=>`<section class="card">
